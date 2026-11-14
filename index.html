@@ -890,7 +890,168 @@
       return tour;
     }
 
-    // Subset-TSP 主求解器：從 21 間店中選出最佳 K 間並規劃最短閉環
+    // 將一條閉環以 2-Opt + Or-Opt 打磨至局部最佳
+    function polishTour(inputTour) {
+      return runTwoOpt(runOrOpt(runTwoOpt(inputTour)));
+    }
+
+    // 多起點打磨：同一組門市換用不同初始排序（最近鄰／繞重心角度／最便宜插入）各打磨一次取最短，
+    // 避免單一起點陷入較差的局部最佳——同一組店不該因建構順序不同而算出不同里程
+    function multiStartPolish(inputTour) {
+      if (inputTour.length < 3) return polishTour(inputTour);
+      const candidates = [[...inputTour]];
+
+      // 最近鄰排序：從起點出發，逐站選最近的未訪門市
+      const nnRemaining = new Set(inputTour);
+      const nnTour = [];
+      let nnCurrent = 0;
+      while (nnRemaining.size > 0) {
+        let nearest = null;
+        let nearestDist = Infinity;
+        for (const cand of nnRemaining) {
+          if (distMatrix[nnCurrent][cand] < nearestDist) {
+            nearestDist = distMatrix[nnCurrent][cand];
+            nearest = cand;
+          }
+        }
+        nnTour.push(nearest);
+        nnRemaining.delete(nearest);
+        nnCurrent = nearest;
+      }
+      candidates.push(nnTour);
+
+      // 角度排序：以門市群重心為中心，依極角繞行
+      const centroidLat = inputTour.reduce((sum, idx) => sum + ALL_NODES[idx].lat, 0) / inputTour.length;
+      const centroidLng = inputTour.reduce((sum, idx) => sum + ALL_NODES[idx].lng, 0) / inputTour.length;
+      candidates.push([...inputTour].sort((a, b) =>
+        Math.atan2(ALL_NODES[a].lat - centroidLat, ALL_NODES[a].lng - centroidLng) -
+        Math.atan2(ALL_NODES[b].lat - centroidLat, ALL_NODES[b].lng - centroidLng)
+      ));
+
+      // 最便宜插入排序：僅針對這組門市重新以 Cheapest Insertion 建構
+      const insertionTour = [];
+      const insertionSet = new Set();
+      while (insertionTour.length < inputTour.length) {
+        let bestNode = null;
+        let bestPos = 0;
+        let bestDelta = Infinity;
+        for (const cand of inputTour) {
+          if (insertionSet.has(cand)) continue;
+          if (insertionTour.length === 0) {
+            const d = distMatrix[0][cand] * 2;
+            if (d < bestDelta) { bestDelta = d; bestNode = cand; bestPos = 0; }
+          } else {
+            for (let pos = 0; pos <= insertionTour.length; pos++) {
+              const prev = pos === 0 ? 0 : insertionTour[pos - 1];
+              const next = pos === insertionTour.length ? 0 : insertionTour[pos];
+              const delta = distMatrix[prev][cand] + distMatrix[cand][next] - distMatrix[prev][next];
+              if (delta < bestDelta) { bestDelta = delta; bestNode = cand; bestPos = pos; }
+            }
+          }
+        }
+        if (bestNode === null) break;
+        insertionTour.splice(bestPos, 0, bestNode);
+        insertionSet.add(bestNode);
+      }
+      candidates.push(insertionTour);
+
+      let best = null;
+      let bestDist = Infinity;
+      for (const cand of candidates) {
+        const polished = polishTour(cand);
+        const d = computeClosedTourDistance(polished);
+        if (d < bestDist) { bestDist = d; best = polished; }
+      }
+      return best;
+    }
+
+    /**
+     * 換店改善（Subset 交換局部搜尋）：
+     * Cheapest Insertion 是逐站看「當下插入增量最小」來選店，屬於短視近利——
+     * 像「園區寶山店」離交大近、早期插入增量小，會在選店前期被挑中，
+     * 但它孤懸西南邊，整圈反而被拉長，還排擠掉市區更順路的門市。
+     * 結果就是候選池明明變大（市＋縣），算出的閉環卻比只勾新竹市還長，並不合理：
+     * 候選池擴大時，最佳解最差也該等於原來那組店的里程。
+     * 此步驟逐一試著把「已選門市」換成「未選門市」（手動鎖定的必去店不換出），
+     * 只要換完打磨後整圈更短就採用，反覆進行到無可改善為止。
+     * 為控制耗時，先以 O(1) 邊際差預估原位換店效益，只打磨最有希望的前 12 名候選。
+     */
+    function runSwapImprovement(initialTour, availableIndices, lockedSet) {
+      let tour = [...initialTour];
+      let bestDist = computeClosedTourDistance(tour);
+      if (tour.length === 0) return tour;
+
+      for (let round = 0; round < 10; round++) {
+        const selectedSet = new Set(tour);
+        const unselected = availableIndices.filter(idx => !selectedSet.has(idx));
+        if (unselected.length === 0) break;
+
+        const quick = [];
+        for (let i = 0; i < tour.length; i++) {
+          const node = tour[i];
+          if (lockedSet.has(node)) continue;
+          const prev = i === 0 ? 0 : tour[i - 1];
+          const next = i === tour.length - 1 ? 0 : tour[i + 1];
+          for (const cand of unselected) {
+            const delta = -distMatrix[prev][node] - distMatrix[node][next] + distMatrix[prev][cand] + distMatrix[cand][next];
+            quick.push({ delta, pos: i, cand });
+          }
+        }
+        quick.sort((a, b) => a.delta - b.delta);
+
+        const tried = new Set();
+        let improved = false;
+
+        // 嘗試一：新店原位取代舊店後打磨
+        for (const q of quick.slice(0, 12)) {
+          const candTour = [...tour];
+          candTour[q.pos] = q.cand;
+          const key = [...candTour].sort((a, b) => a - b).join(',');
+          if (tried.has(key)) continue;
+          tried.add(key);
+          const polished = polishTour(candTour);
+          const d = computeClosedTourDistance(polished);
+          if (d + 1e-6 < bestDist) {
+            tour = polished;
+            bestDist = d;
+            improved = true;
+            break;
+          }
+        }
+
+        // 嘗試二：移除舊店、把新店插到最佳位置後打磨
+        if (!improved) {
+          for (const q of quick.slice(0, 12)) {
+            const reduced = tour.filter((_, idx) => idx !== q.pos);
+            let bestPos = 0;
+            let bestDelta = Infinity;
+            for (let pos = 0; pos <= reduced.length; pos++) {
+              const prev = pos === 0 ? 0 : reduced[pos - 1];
+              const next = pos === reduced.length ? 0 : reduced[pos];
+              const delta = distMatrix[prev][q.cand] + distMatrix[q.cand][next] - distMatrix[prev][next];
+              if (delta < bestDelta) { bestDelta = delta; bestPos = pos; }
+            }
+            const candTour = [...reduced.slice(0, bestPos), q.cand, ...reduced.slice(bestPos)];
+            const key = [...candTour].sort((a, b) => a - b).join(',');
+            if (tried.has(key)) continue;
+            tried.add(key);
+            const polished = polishTour(candTour);
+            const d = computeClosedTourDistance(polished);
+            if (d + 1e-6 < bestDist) {
+              tour = polished;
+              bestDist = d;
+              improved = true;
+              break;
+            }
+          }
+        }
+
+        if (!improved) break;
+      }
+      return tour;
+    }
+
+    // Subset-TSP 主求解器：從已勾選縣市的門市中選出最佳 K 間並規劃最短閉環
     function solveSubsetTSP(requestedK) {
       const availableIndices = [];
       const lockedIndices = [];
@@ -979,9 +1140,16 @@
       }
 
       // 3. 執行 2-Opt + Or-Opt 局部搜尋消除交叉並縮短閉環里程
-      tour = runTwoOpt(tour);
-      tour = runOrOpt(tour);
-      tour = runTwoOpt(tour);
+      tour = polishTour(tour);
+
+      // 3.5 換店改善 + 多起點打磨（交替兩輪）：修正貪心選店的短視——
+      //     候選池擴大（例如多勾新竹縣）時，結果至少要和只勾新竹市一樣好，
+      //     不能因為早期被低增量吸引選進孤懸遠店（寶山店）就讓整圈變長
+      const lockedSet = new Set(lockedIndices);
+      for (let pass = 0; pass < 2; pass++) {
+        tour = runSwapImprovement(tour, availableIndices, lockedSet);
+        tour = multiStartPolish(tour);
+      }
 
       // 4. 若順時針/逆時針方向可調整，統一以「先往清大/光復路方向出發」為優先直覺方向
       if (tour.length >= 2) {
